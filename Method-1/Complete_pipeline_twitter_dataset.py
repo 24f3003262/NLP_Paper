@@ -2,12 +2,15 @@ import jax
 from jax import jit
 import jax.numpy as jnp
 import optax
+import csv
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+from wordcloud import WordCloud
 from sklearn.model_selection import train_test_split
 from transformers import AutoTokenizer
+import copy
+import seaborn as sns
 from sklearn.metrics import (
     f1_score, precision_score, recall_score, accuracy_score,
     confusion_matrix, matthews_corrcoef, cohen_kappa_score,
@@ -39,12 +42,13 @@ def tokenize_in_chunks(texts, batch_size=5000):
         all_ids.append(tokens)
     return jnp.concatenate([jnp.array(x) for x in all_ids], axis=0)
 
+print("--- Tokenizing Dataset ---")
 train_ids = jax.device_put(tokenize_in_chunks(train_df["clean_text"]))
 train_labels = jax.device_put(jnp.array(train_df["category"].values, dtype=jnp.int32))
 test_ids = jax.device_put(tokenize_in_chunks(test_df["clean_text"]))
 test_labels = jax.device_put(jnp.array(test_df["category"].values, dtype=jnp.int32))
 
-# --- 3. ORIGINAL MATHEMATICAL FUNCTIONS (REVERTED) ---
+# --- 3. MODEL FUNCTIONS ---
 def init_params_research(vocab_size):
     key = jax.random.PRNGKey(42)
     k1, k2, k3, k4, k5 = jax.random.split(key, 5)
@@ -77,7 +81,8 @@ def total_loss_fn(params, token_ids, labels, l1_val=1.0, l2_val=0.01, temp=1.0):
     logits = jnp.dot(h2, params['W3']) + params['b3']
 
     l_ce = jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(labels, NUM_CLASSES)))
-    return l_ce + (l1_val * l_rs) + (l2_val * jnp.mean(w_sig))
+    l_sparsity = jnp.mean(w_sig)
+    return l_ce + (l1_val * l_rs) + (l2_val * l_sparsity)
 
 @jax.jit
 def evaluate_metrics_gpu(params, x_ids, y, temp=1.0):
@@ -88,96 +93,137 @@ def evaluate_metrics_gpu(params, x_ids, y, temp=1.0):
     logits = jnp.dot(h2, params['W3']) + params['b3']
     probs = jax.nn.softmax(logits)
     preds = jnp.argmax(logits, axis=1)
+    acc = jnp.mean(preds == y)
     ll = jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(y, NUM_CLASSES)))
     k = jnp.sum(w_sig > 0.5)
-    return preds, probs, ll, k
+    return preds, probs, acc, ll, k
 
 @jax.jit
 def evaluate_baseline_direct(params, x_ids, y):
-    # TRUE ACCURATE BASELINE: Identity Mask (k = 30,522)
     X_prime = jnp.mean(params['emb'][x_ids], axis=1)
-    logits = jnp.dot(jax.nn.relu(jnp.dot(jax.nn.relu(jnp.dot(X_prime, params['W1']) + params['b1']), params['W2']) + params['b2']), params['W3']) + params['b3']
-    return jnp.argmax(logits, axis=1), jax.nn.softmax(logits), jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(y, NUM_CLASSES))), params['emb'].shape[0]
+    h1 = jax.nn.relu(jnp.dot(X_prime, params['W1']) + params['b1'])
+    h2 = jax.nn.relu(jnp.dot(h1, params['W2']) + params['b2'])
+    logits = jnp.dot(h2, params['W3']) + params['b3']
+    probs = jax.nn.softmax(logits)
+    preds = jnp.argmax(logits, axis=1)
+    ll = jnp.mean(optax.softmax_cross_entropy(logits, jax.nn.one_hot(y, NUM_CLASSES)))
+    k_baseline = params['emb'].shape[0]
+    return preds, probs, ll, k_baseline
 
-# --- 4. AUDIT HELPERS ---
-def calculate_audit(y_true, y_pred, y_probs, k, ll):
-    y_t, y_p, y_pb = jax.device_get(y_true), jax.device_get(y_pred), jax.device_get(y_probs)
-    cm = confusion_matrix(y_t, y_p)
+# --- HELPER: ADVANCED METRICS ---
+def calculate_advanced_metrics(y_true, y_pred, y_probs):
+    acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average='weighted')
+    prec = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    rec = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
     recalls = np.diag(cm) / (np.sum(cm, axis=1) + 1e-9)
     g_mean = np.exp(np.mean(np.log(recalls + 1e-9)))
-    
-    stats = {
-        "k": int(k), "Reduct_%": (1 - (int(k) / tokenizer.vocab_size)) * 100,
-        "Accuracy": accuracy_score(y_t, y_p), 
-        "Precision": precision_score(y_t, y_p, average='weighted', zero_division=0),
-        "Recall": recall_score(y_t, y_p, average='weighted', zero_division=0), 
-        "F1": f1_score(y_t, y_p, average='weighted'),
-        "G-Mean": g_mean, "MCC": matthews_corrcoef(y_t, y_p), "Kappa": cohen_kappa_score(y_t, y_p),
-        "AUC": roc_auc_score(np.eye(NUM_CLASSES)[y_t], y_pb, multi_class='ovr', average='weighted'),
-        "AUPRC": average_precision_score(np.eye(NUM_CLASSES)[y_t], y_pb, average='weighted'), 
-        "AIC": 2 * int(k) + 2 * float(ll) * len(y_t)
-    }
-    return stats, cm
+    y_true_oh = np.eye(NUM_CLASSES)[y_true]
+    auc_roc = roc_auc_score(y_true_oh, y_probs, multi_class='ovr', average='weighted')
+    auprc = average_precision_score(y_true_oh, y_probs, average='weighted')
+    return acc, f1, prec, rec, mcc, kappa, g_mean, auc_roc, auprc, cm
 
-def plot_curves(y_true, y_probs, model_name):
-    y_t_oh = np.eye(NUM_CLASSES)[jax.device_get(y_true)]
-    y_pb = jax.device_get(y_probs)
+def plot_research_curves(y_true, y_probs, title_prefix, filename):
+    y_true_oh = np.eye(NUM_CLASSES)[y_true]
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 2, 1)
     for i in range(NUM_CLASSES):
-        fpr, tpr, _ = roc_curve(y_t_oh[:, i], y_pb[:, i])
-        plt.plot(fpr, tpr, label=f'Class {i} (AUC={auc(fpr, tpr):.2f})')
-    plt.plot([0, 1], [0, 1], 'k--'); plt.title(f'{model_name} ROC'); plt.legend()
+        fpr, tpr, _ = roc_curve(y_true_oh[:, i], y_probs[:, i])
+        plt.plot(fpr, tpr, label=f'Class {i}')
+    plt.plot([0, 1], [0, 1], 'k--'); plt.title(f'{title_prefix} ROC'); plt.legend()
     plt.subplot(1, 2, 2)
     for i in range(NUM_CLASSES):
-        p, r, _ = precision_recall_curve(y_t_oh[:, i], y_pb[:, i])
-        plt.plot(r, p, label=f'Class {i}')
-    plt.title(f'{model_name} PR Curve'); plt.legend(); plt.savefig(f"{model_name}_curves.png"); plt.show()
+        precision, recall, _ = precision_recall_curve(y_true_oh[:, i], y_probs[:, i])
+        plt.plot(recall, precision, label=f'Class {i}')
+    plt.title(f'{title_prefix} PR Curve'); plt.legend()
+    plt.savefig(filename); plt.show()
 
-# --- 5. EXECUTION LOOP ---
-optimizer = optax.adam(LEARNING_RATE)
+# --- 4. EXECUTION LOOP ---
+optimizer = optax.adam(learning_rate=LEARNING_RATE)
+best_aic, best_params, best_epoch = float('inf'), None, -1
+results_history, prev_feature_set = [], set()
 params = init_params_research(tokenizer.vocab_size)
 opt_state = optimizer.init(params)
-best_aic, best_params, history, prev_set = float('inf'), None, [], set()
 
-print(f"--- Starting 25 Iteration Run on {jax.devices()[0]} ---")
+@jax.jit
+def train_step(params, opt_state, b_x, b_y, l1, l2, temp):
+    loss_val, grads = jax.value_and_grad(total_loss_fn)(params, b_x, b_y, l1, l2, temp)
+    updates, next_opt_state = optimizer.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), next_opt_state, loss_val
+
+print(f"--- Starting {NUM_EPOCHS} Iteration Run ---")
+
 for epoch in range(NUM_EPOCHS):
     idx = jax.random.permutation(jax.random.PRNGKey(epoch), len(train_ids))
     epoch_x, epoch_y = train_ids[idx], train_labels[idx]
+    epoch_losses = []
     for i in range(0, len(epoch_x), BATCH_SIZE):
         b_x, b_y = epoch_x[i:i+BATCH_SIZE], epoch_y[i:i+BATCH_SIZE]
         if len(b_x) < BATCH_SIZE: continue
-        # USER SETTING: If you want k ~ 1500, set l2_val to 0.001. If k ~ 600, use 0.01.
-        grads = jax.grad(total_loss_fn)(params, b_x, b_y, 1.0, 0.001, 1.0)
-        params = optax.apply_updates(params, optimizer.update(grads, opt_state, params)[0])
+        params, opt_state, loss = train_step(params, opt_state, b_x, b_y, 1.0, 0.01, 1.0)
+        epoch_losses.append(loss)
 
-    p, pr, ll, k = evaluate_metrics_gpu(params, test_ids, test_labels)
-    stats, _ = calculate_audit(test_labels, p, pr, k, ll)
+    # RESTORED: Unpacking matches the 5 return values of evaluate_metrics_gpu
+    preds, probs, acc, ll, k = evaluate_metrics_gpu(params, test_ids, test_labels)
+    y_true, y_pred, y_probs = jax.device_get(test_labels), jax.device_get(preds), jax.device_get(probs)
     
-    curr_set = set(np.where(jax.device_get(jax.nn.sigmoid(params['w'])) > 0.5)[0])
-    stability = len(curr_set & prev_set) / len(curr_set | prev_set) if prev_set else 0.0
-    prev_set = curr_set
+    acc_val, f1_val, prec_val, rec_val, mcc_val, kappa_val, gmean_val, auc_val, auprc_val, _ = calculate_advanced_metrics(y_true, y_pred, y_probs)
 
-    if stats["AIC"] < best_aic:
-        best_aic, best_params = stats["AIC"], jax.tree_util.tree_map(lambda x: jnp.array(x), params)
-        print(f"[*] New Best: Epoch {epoch} | AIC: {best_aic:.2f} | k: {int(k)}")
+    roughness = 1.0 - float(jnp.mean(jax.nn.sigmoid(1.0 - ll)))
+    w_sig = jax.device_get(jax.nn.sigmoid(params['w']))
+    current_feature_set = set(np.where(w_sig > 0.5)[0])
+    jaccard = len(current_feature_set & prev_feature_set) / len(current_feature_set | prev_feature_set) if prev_feature_set else 0.0
+    prev_feature_set = current_feature_set
 
-    history.append([epoch, stats["Accuracy"], stats["Precision"], stats["Recall"], stats["F1"], stats["G-Mean"], stats["MCC"], stats["AIC"], int(k), stats["Reduct_%"], stability])
-    print(f"Epoch {epoch:02d} | F1: {stats['F1']:.4f} | G-Mean: {stats['G-Mean']:.4f} | k: {int(k)} | Stab: {stability:.4f}")
+    n = test_ids.shape[0]
+    cur_aic = float(2 * int(k) + 2 * ll * n)
+    cur_bic = float(int(k) * jnp.log(n) + 2 * ll * n)
+    reduct_pct = (1 - (int(k) / tokenizer.vocab_size)) * 100
 
-# --- 6. SEPARATE EXPORTS ---
+    if cur_aic < best_aic:
+        best_aic, best_epoch = cur_aic, epoch
+        best_params = jax.tree_util.tree_map(lambda x: jnp.array(x), params)
+        print(f"[*] New Best Model | Epoch {epoch} | AIC: {cur_aic:.2f} | k: {int(k)}")
+
+    results_history.append([
+        epoch, f"{np.mean(epoch_losses):.4f}", acc_val, prec_val, rec_val, f1_val, mcc_val, kappa_val, gmean_val, auc_val, auprc_val,
+        float(ll), cur_aic, cur_bic, int(k), reduct_pct, roughness, jaccard
+    ])
+    print(f"Epoch {epoch:02d} | F1: {f1_val:.4f} | BIC: {cur_bic:.2f} | k: {int(k)} | Stab: {jaccard:.4f}")
+
+# --- 5. EXPORTS ---
 print("--- Exporting Forensic Reports ---")
-p_r, pr_r, ll_r, k_r = evaluate_metrics_gpu(best_params, test_ids, test_labels)
-stats_r, cm_r = calculate_audit(test_labels, p_r, pr_r, k_r, ll_r)
-pd.DataFrame([stats_r]).to_csv("reduced_final_metrics.csv", index=False)
-plot_curves(test_labels, pr_r, "Reduced_DRSAR")
 
+# 1. Best Reduced Model Final Stats
+p_r, pr_r, _, ll_r, k_r = evaluate_metrics_gpu(best_params, test_ids, test_labels)
+acc_r, f1_r, pr_r_val, re_r_val, mcc_r, kappa_r, g_r, auc_r, prc_r, cm_r = calculate_advanced_metrics(y_true, jax.device_get(p_r), jax.device_get(pr_r))
+pd.DataFrame([{
+    "k": int(k_r), "Accuracy": acc_r, "Precision": pr_r_val, "Recall": re_r_val, "F1": f1_r, 
+    "MCC": mcc_r, "Kappa": kappa_r, "G-Mean": g_r, "AUC": auc_r, "AUPRC": prc_r, "AIC": best_aic, "Roughness": 1.0 - float(jnp.mean(jax.nn.sigmoid(1.0 - ll_r)))
+}]).to_csv("reduced_final_metrics.csv", index=False)
+plot_research_curves(y_true, jax.device_get(pr_r), "Reduced DRSAR-Net", "reduced_curves.png")
+
+# 2. Original Baseline Final Stats
 p_b, pr_b, ll_b, k_b = evaluate_baseline_direct(best_params, test_ids, test_labels)
-stats_b, cm_b = calculate_audit(test_labels, p_b, pr_b, k_b, ll_b)
-pd.DataFrame([stats_b]).to_csv("baseline_final_metrics.csv", index=False)
-plot_curves(test_labels, pr_b, "Original_Baseline")
+acc_b, f1_b, pr_b_val, re_b_val, mcc_b, kappa_b, g_b, auc_b, prc_b, _ = calculate_advanced_metrics(y_true, jax.device_get(p_b), jax.device_get(pr_b))
+pd.DataFrame([{
+    "k": int(k_b), "Accuracy": acc_b, "Precision": pr_b_val, "Recall": re_b_val, "F1": f1_b, 
+    "MCC": mcc_b, "Kappa": kappa_b, "G-Mean": g_b, "AUC": auc_b, "AUPRC": prc_b, "AIC": float(2*k_b + 2*ll_b*n)
+}]).to_csv("baseline_final_metrics.csv", index=False)
+plot_research_curves(y_true, jax.device_get(pr_b), "Original Baseline", "baseline_curves.png")
 
-h_cols = ["Epoch", "Acc", "Precision", "Recall", "F1", "GMI", "MCC", "AIC", "k", "Reduct%", "Stability"]
-pd.DataFrame(history, columns=h_cols).to_csv("training_history_full.csv", index=False)
+# 3. Training History CSV
+h_cols = ["Epoch", "Loss", "Accuracy", "Precision", "Recall", "F1", "MCC", "Kappa", "G-Mean", "AUC", "AUPRC", "LogLoss", "AIC", "BIC", "k", "Reduct%", "Roughness", "Jaccard_Index"]
+pd.DataFrame(results_history, columns=h_cols).to_csv("training_history_all_epochs.csv", index=False)
 
-print("Done. Three CSVs and all curves generated.")
+# 4. BEST REDUCT FEATURES EXPORT
+w_final = jax.nn.sigmoid(best_params['w'])
+indices = np.where(w_final > 0.5)[0]
+id_to_word = {v: k for k, v in tokenizer.get_vocab().items()}
+reduced_words = [{"word": id_to_word[int(idx)], "weight": float(w_final[idx])} for idx in indices]
+pd.DataFrame(reduced_words).sort_values(by="weight", ascending=False).to_csv("best_reduct_features.csv", index=False)
+
+print("Done. Separate CSVs, Reduced Features, and Curves generated.")
